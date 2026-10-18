@@ -1,0 +1,3 @@
+*.o
+pieboot.elf
+pieboot.bin
