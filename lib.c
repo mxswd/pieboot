@@ -2,6 +2,7 @@
 #include "lib.h"
 #include "uart.h"
 #include "led.h"
+#include "fbcon.h"
 
 void *
 memcpy(void *dst, const void *src, size_t n)
@@ -294,19 +295,52 @@ printf(const char *fmt, ...)
 	uart_puts(buf);
 }
 
-void
-panic(const char *fmt, ...)
+static void
+print_fatal(const char *fmt, va_list ap)
 {
 	char buf[512];
-	va_list ap;
 
-	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
 	uart_puts("pieboot: fatal: ");
 	uart_puts(buf);
 	uart_puts("\n");
+}
+
+/* The error on the screen (the pie turns to text) and the LED blinking. */
+void
+panic(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	print_fatal(fmt, ap);
+	va_end(ap);
+	fbcon_text();
 	led_blink_forever();
+}
+
+/*
+ * Nothing to boot: as on a Mac without a system, a question mark flashes
+ * (over the pie), the LED in step. With -v the screen shows the error.
+ */
+void
+panic_nokernel(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	print_fatal(fmt, ap);
+	va_end(ap);
+	if (!fbcon_question(true)) {
+		led_blink_forever();
+	}
+	uint64_t half = read_cntfrq() / 2;
+	for (bool on = true;; on = !on) {
+		fbcon_question(on);
+		led_set(on);
+		for (uint64_t until = read_cntpct() + half; read_cntpct() < until;) {
+		}
+	}
 }
 
 /* 4MB is plenty for the parsed FDT and the Apple device tree under construction. */

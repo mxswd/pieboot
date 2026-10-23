@@ -29,6 +29,8 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
 int snprintf(char *buf, size_t size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 void printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 __attribute__((noreturn)) void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* A fatal error for a missing or unusable kernel, bundle or RAM disk. */
+__attribute__((noreturn)) void panic_nokernel(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* Bump allocator for boot-time data structures (never freed). */
 void *balloc(size_t size);
@@ -42,6 +44,22 @@ static inline uint32_t be32(const void *p)
 static inline uint64_t be64(const void *p)
 {
 	return ((uint64_t)be32(p) << 32) | be32((const uint8_t *)p + 4);
+}
+
+static inline uint64_t
+read_cntfrq(void)
+{
+	uint64_t v;
+	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(v));
+	return v;
+}
+
+static inline uint64_t
+read_cntpct(void)
+{
+	uint64_t v;
+	__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r"(v));
+	return v;
 }
 
 #endif /* PIEBOOT_LIB_H */

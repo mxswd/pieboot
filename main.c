@@ -9,14 +9,16 @@
  * Output: the kernel entered at EL1, MMU off, x0 = boot_args, with an Apple
  *         device tree describing the machine.
  *
- * Physical layout (all above the firmware's FDT, initrd and this image):
+ * Physical layout, as low in the first RAM range as it fits above this
+ * image (place_kernel()):
  *
  *   physBase                     <- virtBase (kernel VA rounded down to 2MB)
  *   kernel segments              at physBase + (vmaddr - virtBase)
  *   Apple device tree
  *   RAM disk (optional)
  *   boot_args
- *   topOfKernelData; the kernel owns everything up to the end of RAM.
+ *   topOfKernelData; the kernel owns everything up to the end of RAM,
+ *   the firmware's FDT and initrd included once it runs.
  */
 
 #include "adt.h"
@@ -28,6 +30,7 @@
 #include "mbox.h"
 #include "fbcon.h"
 #include "led.h"
+#include "place.h"
 
 #define SZ_16K           0x4000ULL
 #define SZ_2M            0x200000ULL
@@ -118,12 +121,12 @@ open_payload(const uint8_t *p, size_t size, struct payload *out)
 	}
 	const struct bundle_header *h = (const void *)p;
 	if (size < sizeof(*h) || memcmp(h->magic, BUNDLE_MAGIC, 8) || h->version < 1 || h->version > 2) {
-		panic("initrd is neither a Mach-O kernel nor a pieboot bundle");
+		panic_nokernel("initrd is neither a Mach-O kernel nor a pieboot bundle");
 	}
 	for (uint32_t i = 0; i < h->count; i++) {
 		const struct bundle_entry *e = &h->entries[i];
 		if (e->offset + e->size > size) {
-			panic("bundle entry %u out of range", i);
+			panic_nokernel("bundle entry %u out of range", i);
 		}
 		if (!strncmp(e->name, "kernel", sizeof(e->name))) {
 			out->kernel = p + e->offset;
@@ -145,7 +148,7 @@ open_payload(const uint8_t *p, size_t size, struct payload *out)
 		}
 	}
 	if (!out->kernel && !out->nkernels) {
-		panic("bundle has no kernel");
+		panic_nokernel("bundle has no kernel");
 	}
 }
 
@@ -168,10 +171,26 @@ struct machine {
 	uint32_t next_phandle;
 	uint32_t uart_phandle;
 	uint64_t panic_pa, panic_size;  /* the panic region (/pram), if any */
+	uint64_t pool_pa, pool_size;    /* the display pool (carve_display_pool), if any */
 };
+
+/*
+ * A /defaults pmap-io-ranges entry (xnu's pmap_io_range_t): physical memory
+ * the kernel does not manage, and how it maps it (VM_WIMG_*, xnu's
+ * osfmk/arm/memory_types.h; without an entry, as a device's).
+ */
+struct pmap_io_range {
+	uint64_t addr;
+	uint64_t len;
+	uint32_t wimg;
+	uint32_t signature;
+};
+#define VM_WIMG_WCOMB           0x6     /* write-combined: normal memory, not cached */
 
 /* The panic region at the top of RAM: iBoot's kMemoryRegion_Panic. */
 #define PANIC_REGION_SIZE       (512 * 1024)
+/* How long a previous boot's panic log stays on the screen. */
+#define PANIC_PAUSE_SECONDS     15U
 
 /*
  * The start of the header the kernel writes at the start of the panic
@@ -208,10 +227,7 @@ dcache_clean_invalidate(uint64_t start, uint64_t end)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
-static inline uint64_t read_cntfrq(void);
-static inline uint64_t read_cntpct(void);
-
-/* Print the panic log a previous boot left in the panic region. */
+/* Print the panic log a previous boot left in the panic region (as text on the screen). */
 static void
 show_previous_panic(const struct machine *m)
 {
@@ -221,18 +237,24 @@ show_previous_panic(const struct machine *m)
 	    h->panic_log_len > m->panic_size - h->panic_log_offset) {
 		return;
 	}
+	bool pie = fbcon_text();
 	printf("pieboot: the previous boot panicked; its panic log:\n");
 	const char *log = (const char *)h + h->panic_log_offset;
 	for (uint32_t i = 0; i < h->panic_log_len && log[i]; i++) {
 		uart_putc(log[i]);
 	}
 	printf("\npieboot: end of the previous panic log\n");
-	/* Extracted, as iBoot does: the kernel clears the region. */
-	((struct panic_header *)(uintptr_t)m->panic_pa)->magic = 0;
+	/*
+	 * Left in place, unlike iBoot, which extracts it: the kernel keeps it
+	 * for user space (xnu's kern.previous_panic) and then clears the region.
+	 */
 	/* Time to read it (or photograph the screen) before booting again. */
-	printf("pieboot: booting again in 60 seconds\n");
-	uint64_t until = read_cntpct() + read_cntfrq() * 60;
+	printf("pieboot: booting again in %u seconds\n", PANIC_PAUSE_SECONDS);
+	uint64_t until = read_cntpct() + read_cntfrq() * PANIC_PAUSE_SECONDS;
 	while (read_cntpct() < until) {
+	}
+	if (pie) {
+		fbcon_pie();
 	}
 }
 
@@ -241,22 +263,6 @@ read_sysreg_mpidr(void)
 {
 	uint64_t v;
 	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(v));
-	return v;
-}
-
-static inline uint64_t
-read_cntfrq(void)
-{
-	uint64_t v;
-	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(v));
-	return v;
-}
-
-static inline uint64_t
-read_cntpct(void)
-{
-	uint64_t v;
-	__asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r"(v));
 	return v;
 }
 
@@ -270,7 +276,7 @@ current_el(void)
 
 /*
  * A framebuffer the firmware set up and described in the device tree
- * (simple-framebuffer, 32 bits per pixel), for the kernel's console.
+ * (simple-framebuffer, 32 or 16 bits per pixel), for the kernel's console.
  */
 static bool
 dt_framebuffer(const struct fdt *fdt, struct Boot_Video *video)
@@ -296,7 +302,6 @@ dt_framebuffer(const struct fdt *fdt, struct Boot_Video *video)
 		pa = fdt_read_cells(reg->val, ac);
 	}
 	video->v_baseAddr = pa;
-	video->v_display = 0;           /* text console */
 	video->v_rowBytes = stride;
 	video->v_width = width;
 	video->v_height = height;
@@ -358,6 +363,20 @@ bootarg(const char *args, size_t size, const char *key, char *out, size_t outlen
 		}
 		out[n] = '\0';
 		return true;
+	}
+	return false;
+}
+
+/* Whether boot-args have the flag (say "-v") as a word of its own. */
+static bool
+bootflag(const char *args, size_t size, const char *flag)
+{
+	size_t len = strlen(flag);
+	for (size_t i = 0; args && i + len <= size && args[i]; i++) {
+		if ((i == 0 || args[i - 1] == ' ') && !strncmp(args + i, flag, len) &&
+		    (i + len == size || args[i + len] == ' ' || args[i + len] == '\0')) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -460,7 +479,7 @@ select_kernel(const struct fdt *fdt, struct payload *pl, const char *fdt_args)
 			return;
 		}
 	}
-	panic("bundle has no kernel %s", chosen);
+	panic_nokernel("bundle has no kernel %s", chosen);
 }
 
 static uint64_t
@@ -925,6 +944,29 @@ build_adt(struct machine *m, uint64_t ramdisk_pa, uint64_t ramdisk_size)
 		uint64_t range[2] = { ramdisk_pa, ramdisk_size };
 		adt_set(memmap, "RAMDisk", range, sizeof(range));
 	}
+	/*
+	 * What the kernel was placed around (place_kernel()), for the record,
+	 * as { u64 base, u64 size } pairs: this image, which stays; the FDT
+	 * and the initrd, free memory once the kernel runs; the FDT's
+	 * /memreserve/ entries.
+	 */
+	uint64_t range[2] = { (uint64_t)(uintptr_t)__image_start, (uint64_t)(__image_end - __image_start) };
+	adt_set(chosen, "pieboot,image", range, sizeof(range));
+	range[0] = m->fdt.pa;
+	range[1] = m->fdt.size;
+	adt_set(chosen, "pieboot,fdt", range, sizeof(range));
+	range[0] = m->initrd_start;
+	range[1] = m->initrd_end - m->initrd_start;
+	adt_set(chosen, "pieboot,initrd", range, sizeof(range));
+	if (m->fdt.nreserves) {
+		adt_set(chosen, "pieboot,memreserve", m->fdt.reserves, m->fdt.nreserves * sizeof(m->fdt.reserves[0]));
+	}
+	/* The display pool (carve_display_pool), below the kernel, which the IOSurface kext hands out. */
+	if (m->pool_size) {
+		range[0] = m->pool_pa;
+		range[1] = m->pool_size;
+		adt_set(chosen, "pieboot,display-pool", range, sizeof(range));
+	}
 
 	build_cpus(m, root);
 
@@ -974,6 +1016,11 @@ build_adt(struct machine *m, uint64_t ramdisk_pa, uint64_t ramdisk_size)
 	struct adt_node *defaults = adt_new(root, "defaults");
 	if (m->uart_phandle && uart_working()) {       /* a dead UART would hang the kernel's console */
 		adt_set_u32(defaults, "serial-device", m->uart_phandle);
+	}
+	/* The display pool, which the kernel maps write-combined (carve_display_pool). */
+	if (m->pool_size) {
+		struct pmap_io_range pool = { m->pool_pa, m->pool_size, VM_WIMG_WCOMB, 'DPOL' };
+		adt_set(defaults, "pmap-io-ranges", &pool, sizeof(pool));
 	}
 	return root;
 }
@@ -1067,6 +1114,193 @@ scan_memhole(struct machine *m, const char *args, size_t len)
 	}
 }
 
+/*
+ * "pieboot.dmapool=SIZE" (bytes, or with K, M or G; 0 for none): the size
+ * of the display pool (carve_display_pool). The bundle's boot-args come
+ * after the FDT's, so the last one given wins. False if none is given.
+ */
+static bool
+scan_dmapool(const char *args, size_t len, uint64_t *size)
+{
+	static const char key[] = "pieboot.dmapool=";
+	bool found = false;
+	for (size_t i = 0; args && i + sizeof(key) - 1 < len && args[i]; i++) {
+		if ((i > 0 && args[i - 1] != ' ') || strncmp(args + i, key, sizeof(key) - 1)) {
+			continue;
+		}
+		const char *p = args + i + sizeof(key) - 1;
+		uint64_t v;
+		if (!parse_u64(&p, &v)) {
+			continue;
+		}
+		switch (*p | 0x20) {
+		case 'k':
+			v <<= 10;
+			break;
+		case 'm':
+			v <<= 20;
+			break;
+		case 'g':
+			v <<= 30;
+			break;
+		}
+		*size = v;
+		found = true;
+	}
+	return found;
+}
+
+/*
+ * The display pool: RAM set aside at boot for the buffers a display scans
+ * out from, which the IOSurface kext hands out (scan-out IOSurfaces, and
+ * piedrm's display buffers through it). The BCM2711's display (its HVS
+ * and TXP) reaches only the low GB, and xnu has no CMA: within minutes of
+ * a boot, wired pages scattered through the low GB leave no free run of a
+ * 4K buffer's 33 MB there, and soon none of 1080p's 8 MB. So the pool
+ * defaults to 96 MB on the BCM2711 and to none elsewhere (the BCM2712's
+ * display reaches 4 GB); pieboot.dmapool=SIZE sets it.
+ *
+ * It lies low in the first RAM range, in the lowest gap above this image
+ * that holds it on a 2 MB boundary, clear of the /memreserve/ entries and
+ * a framebuffer there, and the kernel goes above it (place_kernel): xnu
+ * manages memory only from the kernel's physical base up, so the pool is
+ * never the VM's, and what lies below the kernel's 32 MB floor goes into
+ * it. The firmware's FDT and initrd may lie in it, and so may an entry
+ * that only reserves either (as for place_kernel): nothing reads them
+ * once the kernel runs, and nothing writes the pool before then. Above
+ * them it would cost the VM all the RAM below them (about 750 MB on a 4
+ * GB Pi 4, whose firmware leaves them just below 0x2F000000). It cannot be
+ * a DRAM hole above the kernel: xnu maps memory it does not manage as a
+ * device's (pmap_cache_attributes: VM_WIMG_IO, where unaligned accesses
+ * fault) whatever cache mode IOKit asks for, unless pmap-io-ranges says
+ * otherwise, and those ranges must lie outside the managed span. So
+ * /defaults pmap-io-ranges has the pool, write-combined, and /chosen
+ * pieboot,display-pool says where it is. None is carved where it would
+ * leave the kernel less than half of the first RAM range, or outside the
+ * display's reach (the low GB).
+ */
+#define DISPLAY_POOL_REACH      0x40000000ULL
+#define DISPLAY_POOL_BCM2711    (96ULL << 20)
+
+/* A /memreserve/ entry that lies within the FDT or the initrd: a bootloader reserving what it loaded for the OS. */
+static bool
+reserves_loaded(const struct machine *m, uint64_t base, uint64_t end)
+{
+	return (base >= m->fdt.pa && end <= m->fdt.pa + m->fdt.size) ||
+	       (base >= m->initrd_start && end <= m->initrd_end);
+}
+
+static void
+carve_display_pool(struct machine *m, const char *fdt_args, const struct payload *pl, const struct Boot_Video *video)
+{
+	uint64_t size = fdt_is_compatible(m->fdt.root, "brcm,bcm2711") ? DISPLAY_POOL_BCM2711 : 0;
+	scan_dmapool(fdt_args, fdt_args ? strlen(fdt_args) + 1 : 0, &size);
+	scan_dmapool(pl->bootargs, pl->bootargs_size, &size);
+	if (!size) {
+		return;
+	}
+	size = ALIGN_UP(size, SZ_2M);
+	struct place_range ram = { m->ram[0].base, m->ram[0].end };
+	struct place_range *busy = balloc(sizeof(*busy) * (m->fdt.nreserves + 1));
+	unsigned nbusy = 0;
+	for (unsigned i = 0; i < m->fdt.nreserves; i++) {
+		uint64_t base = m->fdt.reserves[i].addr, end = base + m->fdt.reserves[i].size;
+		if (end > ram.base && base < ram.end && !reserves_loaded(m, base, end)) {
+			busy[nbusy++] = (struct place_range){ base, end };
+		}
+	}
+	if (video && video->v_rowBytes && video->v_height) {
+		busy[nbusy++] = (struct place_range){ video->v_baseAddr,
+			video->v_baseAddr + video->v_rowBytes * video->v_height };
+	}
+	uint64_t base;
+	if (!place_lowest(ram, (uint64_t)(uintptr_t)__image_end, SZ_2M, 0, size, busy, nbusy, &base) ||
+	    ram.end - base < 2 * size || base + size > DISPLAY_POOL_REACH) {
+		printf("pieboot: no display pool of %lu MB: no room for it below the kernel\n", size >> 20);
+		return;
+	}
+	m->pool_pa = base;
+	m->pool_size = size;
+	printf("pieboot: display pool 0x%lx-0x%lx (%lu MB)\n", base, base + size, size >> 20);
+}
+
+/*
+ * The kernel's physBase, for size bytes from there (the kernel, then its
+ * device tree, RAM disk and boot_args), as low in the first RAM range as
+ * they fit: xnu manages memory from physBase up only (gPhysBase; its VM
+ * starts at topOfKernelData), so RAM below the kernel is lost to it. The
+ * firmware's FDT and initrd may lie high (the Pi 4's and Pi 5's firmware
+ * leave them just below 0x2F000000, which cost 752 MB when the kernel went
+ * above them); the kernel goes below them when it fits there.
+ *
+ * - Above this image, .bss included: PSCI's EL2 vectors, stacks and data
+ *   and the secondary CPUs' entry run from it after the kernel starts.
+ * - At or above 32 MB (KERNEL_L2_BLOCK): xnu's arm_vm_page_granular_helper()
+ *   takes the physical address an L2 block starts at as that of a range
+ *   less the range's offset in the block, which wraps below 0 for a range
+ *   lower than that offset. Its physical aperture is mapped page by page
+ *   (PHYSMAP_GRANULE 0), not in step with the blocks, so a 16K-page kernel
+ *   at 16 MB lost the aperture's page below it on about half the boots
+ *   (arm_vm_prot_finalize: "phystokv: illegal PA: 0x0").
+ * - Above every /memreserve/ entry in that range, so that none reaches
+ *   the VM, except those within the FDT or the initrd (a bootloader
+ *   reserving what it loaded for the OS).
+ * - Clear of the FDT and the initrd, which pieboot reads while it writes
+ *   the kernel. Once the kernel runs nothing reads either (pieboot has
+ *   copied what it needs: the kernel, the RAM disk, the boot-args and
+ *   the device tree's properties), and the VM takes their memory.
+ * - Clear of the framebuffer, should it lie in RAM, and of room below it
+ *   for the kernel's first allocations: the kernel keeps the framebuffer
+ *   out of the VM as a DRAM hole, but those take pages upward from
+ *   topOfKernelData without looking at holes (pmap_next_page). They take
+ *   about 60 MB on the 4 GB Pi 4; a 32nd of the RAM span (126 MB there)
+ *   is room enough.
+ * - Above the display pool (carve_display_pool), which lies low in the
+ *   first RAM range so that the VM never has it.
+ */
+static uint64_t
+place_kernel(const struct machine *m, const struct Boot_Video *video, uint64_t virt_base, uint64_t size)
+{
+	struct place_range ram = { m->ram[0].base, m->ram[0].end };
+	struct place_range fdt = { m->fdt.pa, m->fdt.pa + m->fdt.size };
+	struct place_range initrd = { m->initrd_start, m->initrd_end };
+	struct place_range busy[3] = { fdt, initrd, { 0, 0 } };
+	unsigned nbusy = 2;
+	uint64_t low = (uint64_t)(uintptr_t)__image_end;
+
+	printf("pieboot: pieboot 0x%lx-0x%lx, FDT 0x%lx-0x%lx, initrd 0x%lx-0x%lx\n",
+	    (uint64_t)(uintptr_t)__image_start, low, fdt.base, fdt.end, initrd.base, initrd.end);
+	low = MAX(low, KERNEL_L2_BLOCK);
+	if (m->pool_size) {
+		low = MAX(low, m->pool_pa + m->pool_size);
+	}
+	for (unsigned i = 0; i < m->fdt.nreserves; i++) {
+		uint64_t base = m->fdt.reserves[i].addr, end = base + m->fdt.reserves[i].size;
+		printf("pieboot: /memreserve/ 0x%lx-0x%lx\n", base, end);
+		if (end <= ram.base || base >= ram.end || reserves_loaded(m, base, end)) {
+			continue;
+		}
+		low = MAX(low, end);
+	}
+	if (video && video->v_rowBytes && video->v_height) {
+		uint64_t fb = video->v_baseAddr, guard = m->ram_size / 32;
+		busy[nbusy].base = fb > guard ? fb - guard : 0;
+		busy[nbusy].end = fb + video->v_rowBytes * video->v_height;
+		nbusy++;
+	}
+	/*
+	 * The kernel's bootstrap page tables (start.s) map it with L2 blocks:
+	 * physBase is congruent to virtBase modulo the block.
+	 */
+	uint64_t phys_base;
+	if (!place_lowest(ram, low, KERNEL_L2_BLOCK, virt_base & (KERNEL_L2_BLOCK - 1), size, busy, nbusy,
+	    &phys_base)) {
+		panic("not enough memory for the kernel image (%lu MB in 0x%lx-0x%lx above 0x%lx)",
+		    size >> 20, ram.base, ram.end, low);
+	}
+	return phys_base;
+}
+
 void pieboot_main(void *fdt_blob);
 
 void
@@ -1097,14 +1331,17 @@ pieboot_main(void *fdt_blob)
 		uart_setup(clk, 115200);
 	}
 	/*
-	 * The screen first, so that everything after shows on it as well as on
-	 * the UART; the kernel gets the same framebuffer for its console.
+	 * The screen first: the pie, or with -v everything after as text as
+	 * well as on the UART. The kernel gets the same framebuffer.
 	 */
+	struct fdt_node *chosen = fdt_path(&m.fdt, "/chosen");
+	const char *fdt_bootargs = fdt_prop_str(chosen, "bootargs");
+	bool verbose = bootflag(fdt_bootargs, fdt_bootargs ? strlen(fdt_bootargs) + 1 : 0, "-v");
 	static struct Boot_Video video;
 	bool have_video = dt_framebuffer(&m.fdt, &video) || (mbox_init(&m.fdt) && mbox_framebuffer(&video));
 	if (have_video) {
 		fbcon_init(video.v_baseAddr, (uint32_t)video.v_width, (uint32_t)video.v_height,
-		    (uint32_t)video.v_rowBytes, (uint32_t)(video.v_depth & 0xff));
+		    (uint32_t)video.v_rowBytes, (uint32_t)(video.v_depth & 0xff), verbose);
 	}
 	const char *model = fdt_prop_str(m.fdt.root, "model");
 	printf("\npieboot: boot shim for xnu, EL%u, FDT at %p%s%s\n", current_el(), fdt_blob,
@@ -1118,14 +1355,17 @@ pieboot_main(void *fdt_blob)
 	}
 	m.shim_psci = psci_setup(&m.fdt, current_el());
 
-	struct fdt_node *chosen = fdt_path(&m.fdt, "/chosen");
 	m.initrd_start = chosen_addr(chosen, "linux,initrd-start");
 	m.initrd_end = chosen_addr(chosen, "linux,initrd-end");
 	if (!m.initrd_start || m.initrd_end <= m.initrd_start) {
-		panic("no initrd: load the xnu kernel or bundle as the initrd");
+		panic_nokernel("no initrd: load the xnu kernel or bundle as the initrd");
 	}
 	struct payload pl;
 	open_payload((const uint8_t *)(uintptr_t)m.initrd_start, m.initrd_end - m.initrd_start, &pl);
+	if (!verbose && bootflag(pl.bootargs, pl.bootargs_size, "-v")) {
+		verbose = true;
+		fbcon_text();           /* with what was printed so far */
+	}
 
 	/*
 	 * Memory: every range of every /memory node, sorted and merged. The
@@ -1146,7 +1386,6 @@ pieboot_main(void *fdt_blob)
 			}
 		}
 	}
-	const char *fdt_bootargs = fdt_prop_str(chosen, "bootargs");
 	select_kernel(&m.fdt, &pl, fdt_bootargs);
 	scan_addmem(&m, fdt_bootargs, fdt_bootargs ? strlen(fdt_bootargs) + 1 : 0);
 	scan_addmem(&m, pl.bootargs, pl.bootargs_size);
@@ -1171,6 +1410,7 @@ pieboot_main(void *fdt_blob)
 	m.nram = merged;
 	scan_memhole(&m, fdt_bootargs, fdt_bootargs ? strlen(fdt_bootargs) + 1 : 0);
 	scan_memhole(&m, pl.bootargs, pl.bootargs_size);
+	carve_display_pool(&m, fdt_bootargs, &pl, have_video ? &video : NULL);
 	/*
 	 * The panic region: the top of the last RAM range, above the memory the
 	 * kernel manages, so that a panic log survives a warm reset.
@@ -1209,58 +1449,55 @@ pieboot_main(void *fdt_blob)
 		panic("no memory-mapped devices in the FDT");
 	}
 
-	/* Place the kernel above everything the firmware left in memory. */
-	uint64_t low = MAX((uint64_t)(uintptr_t)__image_end, m.initrd_end);
-	low = MAX(low, m.fdt.pa + m.fdt.size);
-	for (unsigned i = 0; i < m.fdt.nreserves; i++) {
-		uint64_t end = m.fdt.reserves[i].addr + m.fdt.reserves[i].size;
-		if (end > low && m.fdt.reserves[i].addr < low + (256ULL << 20)) {
-			low = end;
-		}
-	}
 	uint64_t virt_base = ALIGN_DOWN(k.vbase, SZ_2M);
-	uint64_t block_offset = virt_base & (KERNEL_L2_BLOCK - 1);
-	uint64_t phys_base = ALIGN_UP(low - block_offset, KERNEL_L2_BLOCK) + block_offset;
-	if (phys_base < low) {
-		phys_base += KERNEL_L2_BLOCK;
-	}
-	uint64_t kernel_end = phys_base + ALIGN_UP(k.vend - virt_base, SZ_16K);
 	uint64_t ram_end = m.ram_base + m.ram_size;
-	uint64_t first_ram_end = m.ram[0].end;  /* the kernel and its data live here */
-
 	printf("pieboot: kernel va 0x%lx-0x%lx entry 0x%lx\n", k.vbase, k.vend, k.entry);
-	printf("pieboot: physBase 0x%lx virtBase 0x%lx\n", phys_base, virt_base);
-	/* Nothing the firmware cached for this memory may land on top of the kernel. */
-	dcache_clean_invalidate(phys_base, first_ram_end);
-	macho_load(&k, virt_base, phys_base);
 
-	/* RAM disk goes after the device tree, whose size is only known once it
-	 * is built, so build it with a provisional RAM disk address first. */
-	uint64_t dt_pa = kernel_end;
+	/*
+	 * The device tree first, as the kernel's place depends on its size:
+	 * built with a provisional RAM disk address, set below (the same size).
+	 * After the kernel (offsets from physBase, which is 2 MB-aligned):
+	 * the device tree, the RAM disk and boot_args.
+	 */
 	mbox_init(&m.fdt);
 	struct adt_node *adt = build_adt(&m, 0, pl.ramdisk_size);
 	uint64_t dt_size = adt_size(adt);
-	uint64_t ramdisk_pa = ALIGN_UP(dt_pa + dt_size + SZ_16K, SZ_16K);
+	uint64_t dt_off = ALIGN_UP(k.vend - virt_base, SZ_16K);
+	uint64_t ramdisk_off = ALIGN_UP(dt_off + dt_size + SZ_16K, SZ_16K);
 	/* memdev counts whole pages (and rounds down): pad with zeroes. */
 	uint64_t ramdisk_len = ALIGN_UP(pl.ramdisk_size, SZ_16K);
+	uint64_t ba_off = ALIGN_UP(ramdisk_off + ramdisk_len, SZ_16K);
+	uint64_t top_off = ALIGN_UP(ba_off + sizeof(struct boot_args), SZ_16K);
+
+	uint64_t phys_base = place_kernel(&m, have_video ? &video : NULL, virt_base, top_off);
+	uint64_t dt_pa = phys_base + dt_off;
+	uint64_t ramdisk_pa = phys_base + ramdisk_off;
+	uint64_t ba_pa = phys_base + ba_off;
+	uint64_t top = phys_base + top_off;
+	printf("pieboot: physBase 0x%lx virtBase 0x%lx\n", phys_base, virt_base);
+	/* Nothing cached for this memory may land on top of what pieboot writes there. */
+	dcache_clean_invalidate(phys_base, top);
+	macho_load(&k, virt_base, phys_base);
+
 	if (pl.ramdisk_size) {
-		struct adt_node *memmap_chosen = NULL;
+		struct adt_node *chosen_node = NULL;
 		for (struct adt_node *c = adt->child; c; c = c->sibling) {
 			struct adt_prop *n = adt_get(c, "name");
 			if (n && !strcmp(n->val, "chosen")) {
-				memmap_chosen = c;
+				chosen_node = c;
 			}
 		}
-		for (struct adt_node *c = memmap_chosen ? memmap_chosen->child : NULL; c; c = c->sibling) {
-			uint64_t range[2] = { ramdisk_pa, ramdisk_len };
-			adt_set(c, "RAMDisk", range, sizeof(range));
+		for (struct adt_node *c = chosen_node ? chosen_node->child : NULL; c; c = c->sibling) {
+			struct adt_prop *n = adt_get(c, "name");
+			if (n && !strcmp(n->val, "memory-map")) {
+				uint64_t range[2] = { ramdisk_pa, ramdisk_len };
+				adt_set(c, "RAMDisk", range, sizeof(range));
+			}
 		}
 		dt_size = adt_size(adt);
 	}
-	uint64_t ba_pa = ALIGN_UP(ramdisk_pa + ramdisk_len, SZ_16K);
-	uint64_t top = ALIGN_UP(ba_pa + sizeof(struct boot_args), SZ_16K);
-	if (top > first_ram_end) {
-		panic("not enough memory for the kernel image");
+	if (dt_off + dt_size > ramdisk_off) {
+		panic("the device tree outgrew its room (%lu bytes)", dt_size);
 	}
 
 	adt_serialize(adt, (uint8_t *)(uintptr_t)dt_pa);
@@ -1286,10 +1523,15 @@ pieboot_main(void *fdt_blob)
 	ba->deviceTreeLength = (uint32_t)dt_size;
 	if (have_video) {
 		ba->Video = video;
+		/*
+		 * As Apple's boot.efi does: graphics mode, unless -v, keeps xnu's
+		 * text console off the screen (PE_create_console), so the pie
+		 * stays; text mode shows the kernel's messages.
+		 */
+		ba->Video.v_display = verbose ? 0 : 1;
 	}
-	const char *fdt_args = fdt_prop_str(chosen, "bootargs");
-	if (fdt_args) {
-		strlcpy(ba->CommandLine, fdt_args, sizeof(ba->CommandLine));
+	if (fdt_bootargs) {
+		strlcpy(ba->CommandLine, fdt_bootargs, sizeof(ba->CommandLine));
 	}
 	if (pl.bootargs_size) {
 		char extra[BOOT_LINE_LENGTH];

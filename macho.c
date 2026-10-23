@@ -34,13 +34,13 @@ macho_inspect(const void *data, size_t size, struct kernel_image *k)
 	const struct mach_header_64 *mh = data;
 
 	if (size < sizeof(*mh) || mh->magic != MH_MAGIC_64) {
-		panic("kernel is not a 64-bit Mach-O");
+		panic_nokernel("kernel is not a 64-bit Mach-O");
 	}
 	if (mh->cputype != CPU_TYPE_ARM64 || mh->filetype != MH_EXECUTE) {
-		panic("kernel is not an arm64 MH_EXECUTE (cputype 0x%x filetype %u)", mh->cputype, mh->filetype);
+		panic_nokernel("kernel is not an arm64 MH_EXECUTE (cputype 0x%x filetype %u)", mh->cputype, mh->filetype);
 	}
 	if (sizeof(*mh) + mh->sizeofcmds > size) {
-		panic("truncated Mach-O load commands");
+		panic_nokernel("truncated Mach-O load commands");
 	}
 	k->data = data;
 	k->size = size;
@@ -55,7 +55,7 @@ macho_inspect(const void *data, size_t size, struct kernel_image *k)
 				continue;
 			}
 			if (seg->fileoff + seg->filesize > size) {
-				panic("a segment extends past the end of the kernel file");
+				panic_nokernel("a segment extends past the end of the kernel file");
 			}
 			k->vbase = MIN(k->vbase, seg->vmaddr);
 			k->vend = MAX(k->vend, seg->vmaddr + seg->vmsize);
@@ -68,7 +68,7 @@ macho_inspect(const void *data, size_t size, struct kernel_image *k)
 		}
 	}
 	if (k->vbase == UINT64_MAX || !k->entry) {
-		panic("kernel has no segments or no LC_UNIXTHREAD entry point");
+		panic_nokernel("kernel has no segments or no LC_UNIXTHREAD entry point");
 	}
 }
 
