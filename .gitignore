@@ -1,3 +1,4 @@
 *.o
 pieboot.elf
 pieboot.bin
+place-test

@@ -34,7 +34,7 @@
 #define TAG_SET_PIXEL_ORDER     0x00048006
 #define TAG_SET_VIRT_OFFSET     0x00048009
 
-#define PIXEL_ORDER_RGB         1       /* 0x00RRGGBB words: xnu's BGRA bytes */
+#define PIXEL_ORDER_BGR         0       /* blue in byte 0: 0x00RRGGBB words, xnu's BGRA bytes */
 
 static uint64_t mbox_base;
 static const struct fdt_node *mbox_node;
@@ -134,7 +134,7 @@ mbox_framebuffer(struct Boot_Video *video)
 	i = 2;
 	const uint32_t size[2] = { width, height };
 	const uint32_t zero2[2] = { 0, 0 };
-	const uint32_t depth = 32, order = PIXEL_ORDER_RGB, align[2] = { 4096, 0 };
+	const uint32_t depth = 32, order = PIXEL_ORDER_BGR, align[2] = { 4096, 0 };
 	put_tag(&i, TAG_SET_PHYS_SIZE, 2, size);
 	put_tag(&i, TAG_SET_VIRT_SIZE, 2, size);
 	put_tag(&i, TAG_SET_VIRT_OFFSET, 2, zero2);
@@ -166,7 +166,6 @@ mbox_framebuffer(struct Boot_Video *video)
 		fb = msg[at_buf] & VC_BUS_MASK;
 	}
 	video->v_baseAddr = fb;
-	video->v_display = 0;           /* text console */
 	video->v_rowBytes = msg[at_pitch];
 	video->v_width = width;
 	video->v_height = height;
